@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# git-repos — recursively find git repos under a directory and report whether
+# each is clean, ahead, behind, or diverged from its upstream branch.
+#
+# Installed on PATH as `git-repos`, git exposes it as a subcommand: `git repos`.
+#
+# Discovery is "prune at repo boundaries": it walks the tree but stops
+# descending the moment a directory is itself a repo. So workspace folders
+# (no .git) are descended into to find their child repos, while a repo's own
+# working tree, node_modules, submodules, etc. are not re-scanned.
+#
+# Usage:
+#   git repos [-f] [-a] [-p] [-n] [-d DIR]
+#
+#   -f        fetch from each remote first (slower, but ahead/behind is current)
+#   -a        attention only: show only repos that are dirty, ahead, behind,
+#             diverged, or have no upstream (hide clean & in-sync repos)
+#   -p        pull: fast-forward repos that are clean AND strictly behind their
+#             upstream. Dirty, ahead, and diverged repos are never touched.
+#             Implies -f so the fast-forward uses fresh remote state.
+#   -n        dry run: with -p, report which repos WOULD be fast-forwarded
+#             without changing anything.
+#   -d DIR    directory to scan (default: current directory)
+#
+# Without -f, ahead/behind is computed against the last-known remote state
+# stored locally, so pass -f when you want it freshly checked.
+
+set -uo pipefail
+
+FETCH=0
+ATTENTION=0
+PULL=0
+DRYRUN=0
+SCAN_DIR="."
+
+while getopts "fapnd:" opt; do
+  case "$opt" in
+    f) FETCH=1 ;;
+    a) ATTENTION=1 ;;
+    p) PULL=1 ;;
+    n) DRYRUN=1 ;;
+    d) SCAN_DIR="$OPTARG" ;;
+    *) echo "Usage: git repos [-f] [-a] [-p] [-n] [-d DIR]" >&2; exit 1 ;;
+  esac
+done
+
+# Pulling needs current remote refs, so a fast-forward is only meaningful
+# after a fetch.
+[ "$PULL" -eq 1 ] && FETCH=1
+
+# Colors (auto-disabled when output is not a terminal)
+if [ -t 1 ]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  BLUE=$'\033[34m'; GREY=$'\033[90m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=; GREEN=; YELLOW=; BLUE=; GREY=; BOLD=; RESET=
+fi
+
+cd "$SCAN_DIR" || { echo "Cannot cd into $SCAN_DIR" >&2; exit 1; }
+
+printf "%b%-44s %-22s %-7s %s%b\n" "$BOLD" "REPO" "BRANCH" "STATE" "SYNC" "$RESET"
+printf "%b%s%b\n" "$GREY" "------------------------------------------------------------------------------------------" "$RESET"
+
+total=0; clean_n=0; dirty_n=0
+sync_n=0; ahead_n=0; behind_n=0; diverged_n=0; noup_n=0
+pulled_n=0; fffail_n=0
+
+# Find repo roots: skip heavy/irrelevant dirs, then for each directory test
+# whether it contains a .git entry (file OR dir). If so, print it and prune so
+# we never descend into the repo's working tree. Sorted for stable output.
+while IFS= read -r repo; do
+  repo="${repo#./}"
+  total=$((total + 1))
+  git_c=(git -C "$repo")
+
+  [ "$FETCH" -eq 1 ] && "${git_c[@]}" fetch --quiet --all 2>/dev/null
+
+  branch=$("${git_c[@]}" symbolic-ref --short -q HEAD || "${git_c[@]}" rev-parse --short HEAD 2>/dev/null)
+
+  attn=0          # does this repo need attention?
+  dirty_flag=0    # uncommitted changes present?
+  behind_only=0   # strictly behind upstream (no local commits ahead)?
+
+  # Working-tree state
+  if [ -n "$("${git_c[@]}" status --porcelain 2>/dev/null)" ]; then
+    state="${YELLOW}dirty${RESET}"; dirty_n=$((dirty_n+1)); attn=1; dirty_flag=1
+  else
+    state="${GREEN}clean${RESET}"; clean_n=$((clean_n+1))
+  fi
+
+  # Upstream sync
+  upstream=$("${git_c[@]}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)
+  if [ -z "$upstream" ]; then
+    sync="${GREY}no upstream${RESET}"; noup_n=$((noup_n+1)); attn=1
+  else
+    counts=$("${git_c[@]}" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null)
+    a=$(echo "$counts" | awk '{print $1+0}')   # local commits not on upstream
+    b=$(echo "$counts" | awk '{print $2+0}')   # upstream commits not local
+    if   [ "$a" -eq 0 ] && [ "$b" -eq 0 ]; then sync="${GREEN}in sync${RESET}";          sync_n=$((sync_n+1))
+    elif [ "$a" -gt 0 ] && [ "$b" -gt 0 ]; then sync="${RED}diverged +$a/-$b${RESET}";   diverged_n=$((diverged_n+1)); attn=1
+    elif [ "$a" -gt 0 ];                   then sync="${BLUE}ahead +$a${RESET}";          ahead_n=$((ahead_n+1));    attn=1
+    else                                        sync="${RED}behind -$b${RESET}";          behind_n=$((behind_n+1));   attn=1; behind_only=1
+    fi
+  fi
+
+  # -p: fast-forward only clean, strictly-behind repos. Never touch dirty,
+  # ahead, or diverged repos (--ff-only would refuse a non-ff anyway).
+  action=""
+  if [ "$PULL" -eq 1 ] && [ "$behind_only" -eq 1 ] && [ "$dirty_flag" -eq 0 ]; then
+    if [ "$DRYRUN" -eq 1 ]; then
+      action="  ${BLUE}→ would fast-forward${RESET}"; pulled_n=$((pulled_n+1))
+    elif "${git_c[@]}" merge --ff-only "$upstream" >/dev/null 2>&1; then
+      action="  ${GREEN}→ fast-forwarded${RESET}"; pulled_n=$((pulled_n+1))
+    else
+      action="  ${RED}→ ff failed${RESET}"; fffail_n=$((fffail_n+1))
+    fi
+  fi
+
+  # In attention-only mode, skip repos that are clean and in sync
+  [ "$ATTENTION" -eq 1 ] && [ "$attn" -eq 0 ] && continue
+
+  printf "%-44s %-22s %b %b%b\n" "$repo" "$branch" "$state" "$sync" "$action"
+done < <(
+  find . \
+    -type d \( -name node_modules -o -name .venv -o -name venv -o -name .tox \
+               -o -name .git -o -name vendor \) -prune -o \
+    -type d -exec test -e '{}/.git' ';' -print -prune \
+  | sort
+)
+
+echo
+printf "%b%d git repos%b — %bclean %d%b / %bdirty %d%b   |   %bin-sync %d%b  %bahead %d%b  %bbehind %d%b  %bdiverged %d%b  %sno-upstream %d%s\n" \
+  "$BOLD" "$total" "$RESET" \
+  "$GREEN" "$clean_n" "$RESET" "$YELLOW" "$dirty_n" "$RESET" \
+  "$GREEN" "$sync_n" "$RESET" "$BLUE" "$ahead_n" "$RESET" \
+  "$RED" "$behind_n" "$RESET" "$RED" "$diverged_n" "$RESET" "$GREY" "$noup_n" "$RESET"
+
+if [ "$PULL" -eq 1 ]; then
+  if [ "$DRYRUN" -eq 1 ]; then
+    printf "%b[dry run] would fast-forward %d repo(s)%b\n" "$BLUE" "$pulled_n" "$RESET"
+  else
+    printf "%bfast-forwarded %d repo(s)%b" "$GREEN" "$pulled_n" "$RESET"
+    [ "$fffail_n" -gt 0 ] && printf ", %b%d failed%b" "$RED" "$fffail_n" "$RESET"
+    echo
+  fi
+fi
