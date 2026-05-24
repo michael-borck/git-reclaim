@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# git-sweep — reclaim disk space across a tree of git repos.
+#
+#   * Reports (and optionally purges) regenerable cache directories
+#     (node_modules, virtualenvs, build/test caches) — these are never
+#     git-tracked, so removing them never touches your source or history;
+#     you just reinstall next time you use the project.
+#   * With -r, lists repos that are SAFE TO DELETE: clean working tree, has a
+#     remote, no unpushed commits on any local branch, no stashes — i.e. the
+#     remote already has everything, so you can re-clone what you remove.
+#
+# Installed on PATH as `git-sweep`, git runs it as `git sweep`.
+#
+# Usage:
+#   git sweep [-p] [-r] [-d DIR]
+#
+#   (default)  dry run: report reclaimable cache space; deletes nothing
+#   -p         purge: delete the cache directories
+#   -r         also list repos that are safe to delete (size + last commit)
+#   -d DIR     directory to scan (default: current directory)
+
+set -uo pipefail
+
+PURGE=0
+REPOS=0
+SCAN_DIR="."
+
+while getopts "prd:" opt; do
+  case "$opt" in
+    p) PURGE=1 ;;
+    r) REPOS=1 ;;
+    d) SCAN_DIR="$OPTARG" ;;
+    *) echo "Usage: git sweep [-p] [-r] [-d DIR]" >&2; exit 1 ;;
+  esac
+done
+
+if [ -t 1 ]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  BLUE=$'\033[34m'; GREY=$'\033[90m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=; GREEN=; YELLOW=; BLUE=; GREY=; BOLD=; RESET=
+fi
+
+cd "$SCAN_DIR" || { echo "Cannot cd into $SCAN_DIR" >&2; exit 1; }
+
+# Cache directory names that are always regenerable and never git-tracked.
+# (dist/ and build/ are deliberately excluded — they are occasionally committed.)
+cache_find() {
+  find . -type d \( \
+       -name node_modules -o -name .venv -o -name venv -o -name __pycache__ \
+    -o -name .pytest_cache -o -name .ruff_cache -o -name .mypy_cache \
+    -o -name .next -o -name target \
+    \) -prune "$@"
+}
+
+human() {  # bytes-in-KB -> human; reads $1
+  awk -v k="$1" 'BEGIN{
+    if (k>=1048576) printf "%.1fG", k/1048576;
+    else if (k>=1024) printf "%dM", k/1024;
+    else printf "%dK", k }'
+}
+
+# ---- caches ----
+echo "${BOLD}Regenerable caches under $(pwd)${RESET}"
+sizes=$(cache_find -print0 2>/dev/null | xargs -0 du -sk 2>/dev/null | sort -rn)
+if [ -z "$sizes" ]; then
+  echo "  ${GREY}none found${RESET}"
+else
+  echo "$sizes" | head -12 | awk -v g="$GREY" -v r="$RESET" '{
+    kb=$1; $1=""; sub(/^[ \t]+/,"");
+    h = kb>=1048576 ? sprintf("%.1fG",kb/1048576) : kb>=1024 ? sprintf("%dM",kb/1024) : sprintf("%dK",kb);
+    printf "  %-8s %s%s%s\n", h, g, $0, r }'
+  n=$(echo "$sizes" | wc -l | tr -d ' ')
+  tot=$(echo "$sizes" | awk '{s+=$1} END{print s+0}')
+  [ "$n" -gt 12 ] && echo "  ${GREY}... and $((n-12)) more${RESET}"
+  printf "  %s%d cache dirs, %s reclaimable%s\n" "$BOLD" "$n" "$(human "$tot")" "$RESET"
+
+  if [ "$PURGE" -eq 1 ]; then
+    before=$(df -k . | tail -1 | awk '{print $4}')
+    cache_find -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null
+    after=$(df -k . | tail -1 | awk '{print $4}')
+    printf "  %s-> purged %d dirs, freed %s (free: %s -> %s)%s\n" \
+      "$GREEN" "$n" "$(human $((after-before)))" "$(human "$before")" "$(human "$after")" "$RESET"
+  else
+    echo "  ${YELLOW}(dry run — pass -p to delete these)${RESET}"
+  fi
+fi
+
+# ---- repos safe to delete ----
+[ "$REPOS" -eq 1 ] || exit 0
+echo
+echo "${BOLD}Repos safe to delete (remote has everything), biggest first${RESET}"
+
+# Collect into a temp file so loop counters survive (a piped while runs in a
+# subshell and would lose them).
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+keep_n=0
+while IFS= read -r repo; do
+  repo="${repo#./}"
+  remotes=$(git -C "$repo" remote 2>/dev/null)
+  dirty=$(git -C "$repo" status --porcelain 2>/dev/null | head -1)
+  unpushed=$(git -C "$repo" log --branches --not --remotes --oneline 2>/dev/null | head -1)
+  stash=$(git -C "$repo" stash list 2>/dev/null | head -1)
+  if [ -z "$remotes" ] || [ -n "$dirty" ] || [ -n "$unpushed" ] || [ -n "$stash" ]; then
+    keep_n=$((keep_n+1)); continue
+  fi
+  kb=$(du -sk "$repo" 2>/dev/null | awk '{print $1}')
+  last=$(git -C "$repo" log -1 --format=%cs 2>/dev/null)
+  url=$(git -C "$repo" remote get-url origin 2>/dev/null || echo '?')
+  printf "%s\t%s\t%s\t%s\n" "${kb:-0}" "$last" "$repo" "$url" >> "$tmp"
+done < <(
+  find . -type d \( -name node_modules -o -name .venv -o -name venv -o -name .tox \
+                    -o -name .git -o -name vendor \) -prune -o \
+         -type d -exec test -e '{}/.git' ';' -print -prune | sort
+)
+
+safe_n=$(wc -l < "$tmp" | tr -d ' ')
+safe_total=$(awk '{s+=$1} END{print s+0}' "$tmp")
+sort -rn "$tmp" | awk -F'\t' -v g="$GREY" -v r="$RESET" '{
+    kb=$1; h = kb>=1048576 ? sprintf("%.1fG",kb/1048576) : kb>=1024 ? sprintf("%dM",kb/1024) : sprintf("%dK",kb);
+    printf "  %-8s last:%-10s %-44s %s%s%s\n", h, $2, $3, g, $4, r }'
+
+printf "%s%d safe (%s) / %d keep%s  %s(keep = dirty, unpushed, stashed, or no remote)%s\n" \
+  "$BOLD" "$safe_n" "$(human "$safe_total")" "$keep_n" "$RESET" "$GREY" "$RESET"
