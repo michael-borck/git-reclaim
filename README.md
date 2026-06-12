@@ -1,12 +1,15 @@
 # git-toolkit
 
 Small, zero-dependency **local git** helpers for people who keep many clones
-side by side. Pure bash, no network/API tokens, fully offline — it reads your
-working copies, it doesn't talk to GitHub.
+side by side. Pure bash, no GitHub API, no tokens — everything is plain `git`
+against your local working copies. The only network it ever touches is
+`git fetch`, and only when you explicitly ask for it with `-f`.
 
-> Complements [`gh`](https://cli.github.com/) and
-> [gh-toolkit](https://github.com/michael-borck/gh-toolkit) (which manage
-> GitHub *remotely*). This one is about the state of your *local* clones.
+> **Scope:** if the `git` binary on a local clone can do it, it belongs here.
+> If it needs the GitHub API — bulk listing, health checks, topics, portfolio
+> sites — that's [gh-toolkit](https://github.com/michael-borck/gh-toolkit)'s
+> job (or [`gh`](https://cli.github.com/)'s). This toolkit only reports on and
+> tidies the clones you already have.
 
 Each tool is a [git custom subcommand](https://git-scm.com/book/en/v2/Git-Internals-Git-Internals):
 an executable named `git-foo` on your `PATH` is runnable as `git foo`.
@@ -85,31 +88,46 @@ git repos -f -a -d ~/work
 - `-p` only fast-forwards repos that are **clean and strictly behind**. Dirty,
   ahead, and diverged repos are skipped entirely; `--ff-only` would refuse a
   non-fast-forward anyway. Fast-forwards are reversible via `git reflog`.
-- To avoid hanging on credential prompts when fetching many repos, run with
-  `GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -oBatchMode=yes'` so auth
-  failures fail fast instead of blocking.
+- Fetching **never prompts for credentials**: the script sets
+  `GIT_TERMINAL_PROMPT=0` and ssh `BatchMode` itself, so a repo with broken
+  auth fails fast instead of hanging the whole scan. (This means
+  passphrase-protected keys need an agent; a caller-provided
+  `GIT_SSH_COMMAND` is respected.)
+- A branch whose upstream is configured but whose remote-tracking ref is
+  missing (deleted on the remote, then pruned) is reported as
+  **`upstream gone`**, not "in sync".
 
 ## `git sweep`
 
 ```
-git sweep [-p] [-r] [-d DIR]
+git sweep [-p] [-g] [-r] [-d DIR]
 
   (default)  dry run: report reclaimable cache space; deletes nothing
-  -p         purge: delete the cache directories
+  -p         purge: delete the cache directories (any dir git tracks files
+             inside is skipped, never deleted)
+  -g         compact history: run `git gc` (and `git lfs prune` if installed)
+             in every repo and report the .git space reclaimed
   -r         also list repos that are safe to delete (size + last commit + URL)
   -d DIR     directory to scan (default: current directory)
 ```
 
-Two ways to free space across a tree of clones:
+Three ways to free space across a tree of clones:
 
 - **Purge regenerable caches.** It finds `node_modules`, `.venv`/`venv`,
   `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.next`, and
-  `target` — all of which are *never git-tracked* and rebuild on demand. So
-  `git sweep -p` reclaims space **without touching your source, history, or
-  even uncommitted work**, and it's safe to run on every repo regardless of
-  its git state. (`dist/` and `build/` are deliberately excluded, since those
-  are occasionally committed.) Re-run `npm install` / `uv sync` next time you
-  open a project.
+  `target` — caches that rebuild on demand. So `git sweep -p` reclaims space
+  **without touching your source, history, or uncommitted work**, and it's
+  safe to run on every repo regardless of its git state: if a directory with
+  one of these names turns out to be git-tracked (a committed `target/`,
+  say), the purge detects that and **skips it**. (`dist/` and `build/` are
+  deliberately excluded, since those are occasionally committed.) Re-run
+  `npm install` / `uv sync` next time you open a project.
+
+- **Compact `.git` itself.** `git sweep -g` runs `git gc` (plus
+  `git lfs prune` when git-lfs is installed) in every repo and reports the
+  space reclaimed per repo — often the biggest win on long-lived clones.
+  This is standard git maintenance: nothing reachable is deleted, and lfs
+  prune always retains unpushed objects.
 
 - **Find repos that are safe to delete.** `git sweep -r` lists repos where the
   remote already has everything — clean working tree, has a remote, no unpushed
@@ -122,13 +140,28 @@ Two ways to free space across a tree of clones:
 ```bash
 git sweep              # what could I reclaim from caches? (dry run)
 git sweep -p           # actually purge the caches
+git sweep -g           # repack every repo's .git (git gc)
 git sweep -r           # caches report + list of repos safe to delete
 git sweep -r -d ~/work # scan a different tree
 ```
 
-> `git sweep` only ever deletes **caches** (and only with `-p`). It never
-> deletes a repo — it just *reports* which are safe, so you stay in control of
-> removing whole clones. Pair it with the re-clone URLs it prints.
+> `git sweep` only ever deletes **caches** (and only with `-p`; `-g` just
+> repacks history in place). It never deletes a repo — it just *reports*
+> which are safe, so you stay in control of removing whole clones. Pair it
+> with the re-clone URLs it prints.
+
+## Development
+
+CI runs [shellcheck](https://www.shellcheck.net/) and a
+[bats](https://github.com/bats-core/bats-core) suite (`test/`) that builds
+throwaway repo trees and exercises discovery, fast-forwarding, and the purge
+safety guards. Locally:
+
+```bash
+brew install bats-core shellcheck   # or: apt-get install bats shellcheck
+shellcheck bin/git-* install.sh
+bats test/
+```
 
 ## License
 

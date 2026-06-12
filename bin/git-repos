@@ -11,7 +11,7 @@
 # working tree, node_modules, submodules, etc. are not re-scanned.
 #
 # Usage:
-#   git repos [-f] [-a] [-p] [-n] [-d DIR]
+#   git repos [-f] [-a] [-p] [-n] [-d DIR]   (-h for full help)
 #
 #   -f        fetch from each remote first (slower, but ahead/behind is current)
 #   -a        attention only: show only repos that are dirty, ahead, behind,
@@ -34,20 +34,44 @@ PULL=0
 DRYRUN=0
 SCAN_DIR="."
 
-while getopts "fapnd:" opt; do
+usage() {
+  cat <<'EOF'
+Usage: git repos [-f] [-a] [-p] [-n] [-d DIR]
+
+  -f        fetch from each remote first (slower, but ahead/behind is current)
+  -a        attention only: show only repos that are dirty, ahead, behind,
+            diverged, or have no upstream
+  -p        fast-forward repos that are clean AND strictly behind their
+            upstream (implies -f); dirty/ahead/diverged repos are never touched
+  -n        dry run: with -p, report what would be fast-forwarded
+  -d DIR    directory to scan (default: current directory)
+  -h        show this help
+EOF
+}
+
+while getopts "fapnd:h" opt; do
   case "$opt" in
     f) FETCH=1 ;;
     a) ATTENTION=1 ;;
     p) PULL=1 ;;
     n) DRYRUN=1 ;;
     d) SCAN_DIR="$OPTARG" ;;
-    *) echo "Usage: git repos [-f] [-a] [-p] [-n] [-d DIR]" >&2; exit 1 ;;
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
   esac
 done
+
+[ "$DRYRUN" -eq 1 ] && [ "$PULL" -eq 0 ] && \
+  echo "warning: -n has no effect without -p" >&2
 
 # Pulling needs current remote refs, so a fast-forward is only meaningful
 # after a fetch.
 [ "$PULL" -eq 1 ] && FETCH=1
+
+# Bulk fetching must never hang on a credential prompt — fail that repo's
+# fetch fast instead. A caller-provided GIT_SSH_COMMAND wins.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
 
 # Colors (auto-disabled when output is not a terminal)
 if [ -t 1 ]; then
@@ -94,13 +118,20 @@ while IFS= read -r repo; do
   if [ -z "$upstream" ]; then
     sync="${GREY}no upstream${RESET}"; noup_n=$((noup_n+1)); attn=1
   else
+    # An upstream can be *configured* while its ref is missing (branch deleted
+    # on the remote, then pruned) — rev-list fails then, and empty counts must
+    # not read as "in sync".
     counts=$("${git_c[@]}" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null)
-    a=$(echo "$counts" | awk '{print $1+0}')   # local commits not on upstream
-    b=$(echo "$counts" | awk '{print $2+0}')   # upstream commits not local
-    if   [ "$a" -eq 0 ] && [ "$b" -eq 0 ]; then sync="${GREEN}in sync${RESET}";          sync_n=$((sync_n+1))
-    elif [ "$a" -gt 0 ] && [ "$b" -gt 0 ]; then sync="${RED}diverged +$a/-$b${RESET}";   diverged_n=$((diverged_n+1)); attn=1
-    elif [ "$a" -gt 0 ];                   then sync="${BLUE}ahead +$a${RESET}";          ahead_n=$((ahead_n+1));    attn=1
-    else                                        sync="${RED}behind -$b${RESET}";          behind_n=$((behind_n+1));   attn=1; behind_only=1
+    if [ -z "$counts" ]; then
+      sync="${RED}upstream gone${RESET}"; noup_n=$((noup_n+1)); attn=1
+    else
+      a=$(echo "$counts" | awk '{print $1+0}')   # local commits not on upstream
+      b=$(echo "$counts" | awk '{print $2+0}')   # upstream commits not local
+      if   [ "$a" -eq 0 ] && [ "$b" -eq 0 ]; then sync="${GREEN}in sync${RESET}";          sync_n=$((sync_n+1))
+      elif [ "$a" -gt 0 ] && [ "$b" -gt 0 ]; then sync="${RED}diverged +$a/-$b${RESET}";   diverged_n=$((diverged_n+1)); attn=1
+      elif [ "$a" -gt 0 ];                   then sync="${BLUE}ahead +$a${RESET}";          ahead_n=$((ahead_n+1));    attn=1
+      else                                        sync="${RED}behind -$b${RESET}";          behind_n=$((behind_n+1));   attn=1; behind_only=1
+      fi
     fi
   fi
 

@@ -13,10 +13,12 @@
 # Installed on PATH as `git-sweep`, git runs it as `git sweep`.
 #
 # Usage:
-#   git sweep [-p] [-r] [-d DIR]
+#   git sweep [-p] [-g] [-r] [-d DIR]   (-h for full help)
 #
 #   (default)  dry run: report reclaimable cache space; deletes nothing
-#   -p         purge: delete the cache directories
+#   -p         purge: delete the cache directories (skips any dir git tracks
+#              files inside)
+#   -g         compact history: run `git gc` in every repo
 #   -r         also list repos that are safe to delete (size + last commit)
 #   -d DIR     directory to scan (default: current directory)
 
@@ -24,22 +26,40 @@ set -uo pipefail
 
 PURGE=0
 REPOS=0
+GC=0
 SCAN_DIR="."
 
-while getopts "prd:" opt; do
+usage() {
+  cat <<'EOF'
+Usage: git sweep [-p] [-g] [-r] [-d DIR]
+
+  (default)  dry run: report reclaimable cache space; deletes nothing
+  -p         purge: delete the cache directories (any dir git tracks files
+             inside is skipped, never deleted)
+  -g         compact history: run `git gc` (and `git lfs prune` if installed)
+             in every repo and report the .git space reclaimed
+  -r         also list repos that are safe to delete (size + last commit)
+  -d DIR     directory to scan (default: current directory)
+  -h         show this help
+EOF
+}
+
+while getopts "pgrd:h" opt; do
   case "$opt" in
     p) PURGE=1 ;;
+    g) GC=1 ;;
     r) REPOS=1 ;;
     d) SCAN_DIR="$OPTARG" ;;
-    *) echo "Usage: git sweep [-p] [-r] [-d DIR]" >&2; exit 1 ;;
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
   esac
 done
 
 if [ -t 1 ]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
-  BLUE=$'\033[34m'; GREY=$'\033[90m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+  GREY=$'\033[90m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 else
-  RED=; GREEN=; YELLOW=; BLUE=; GREY=; BOLD=; RESET=
+  RED=; GREEN=; YELLOW=; GREY=; BOLD=; RESET=
 fi
 
 cd "$SCAN_DIR" || { echo "Cannot cd into $SCAN_DIR" >&2; exit 1; }
@@ -47,7 +67,10 @@ cd "$SCAN_DIR" || { echo "Cannot cd into $SCAN_DIR" >&2; exit 1; }
 # Cache directory names that are always regenerable and never git-tracked.
 # (dist/ and build/ are deliberately excluded — they are occasionally committed.)
 cache_find() {
-  find . -type d \( \
+  # .git is pruned first and never matched: branches named e.g. target/v2
+  # create real directories under .git/refs/heads/ that would otherwise
+  # match the cache names below and be purged.
+  find . -type d -name .git -prune -o -type d \( \
        -name node_modules -o -name .venv -o -name venv -o -name __pycache__ \
     -o -name .pytest_cache -o -name .ruff_cache -o -name .mypy_cache \
     -o -name .next -o -name target \
@@ -78,13 +101,60 @@ else
 
   if [ "$PURGE" -eq 1 ]; then
     before=$(df -k . | tail -1 | awk '{print $4}')
-    cache_find -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null
+    purged=0; skipped=0; failed=0
+    while IFS= read -r -d '' dir; do
+      # A dir is only a cache if git tracks nothing inside it. A *committed*
+      # target/ or venv/ is source, and uncommitted edits to tracked files in
+      # it would be unrecoverable.
+      if [ -n "$(git -C "$dir" ls-files 2>/dev/null | head -1)" ]; then
+        printf "  %sskipped %s (git tracks files inside it)%s\n" \
+          "$YELLOW" "${dir#./}" "$RESET"
+        skipped=$((skipped+1)); continue
+      fi
+      rm -rf "$dir" 2>/dev/null
+      if [ -e "$dir" ]; then failed=$((failed+1)); else purged=$((purged+1)); fi
+    done < <(cache_find -print0 2>/dev/null)
     after=$(df -k . | tail -1 | awk '{print $4}')
-    printf "  %s-> purged %d dirs, freed %s (free: %s -> %s)%s\n" \
-      "$GREEN" "$n" "$(human $((after-before)))" "$(human "$before")" "$(human "$after")" "$RESET"
+    freed=$((after - before)); [ "$freed" -lt 0 ] && freed=0
+    printf "  %s-> purged %d of %d dirs, freed %s (free: %s -> %s)%s\n" \
+      "$GREEN" "$purged" "$n" "$(human "$freed")" "$(human "$before")" "$(human "$after")" "$RESET"
+    [ "$failed" -gt 0 ] && \
+      printf "  %s-> %d dir(s) could not be removed%s\n" "$RED" "$failed" "$RESET"
   else
     echo "  ${YELLOW}(dry run — pass -p to delete these)${RESET}"
   fi
+fi
+
+# Repo discovery, shared by -g and -r: prune cache/vendor dirs, then print
+# (and stop at) any directory containing a .git entry (file OR dir).
+repo_find() {
+  find . -type d \( -name node_modules -o -name .venv -o -name venv -o -name .tox \
+                    -o -name .git -o -name vendor \) -prune -o \
+         -type d -exec test -e '{}/.git' ';' -print -prune | sort
+}
+
+# ---- gc: compact .git dirs ----
+if [ "$GC" -eq 1 ]; then
+  echo
+  echo "${BOLD}Compacting repo history (git gc)${RESET}"
+  gc_n=0; gc_before=0; gc_after=0
+  have_lfs=0; command -v git-lfs >/dev/null 2>&1 && have_lfs=1
+  while IFS= read -r repo; do
+    repo="${repo#./}"
+    gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || continue
+    b=$(du -sk "$gitdir" 2>/dev/null | awk '{print $1+0}'); b=${b:-0}
+    git -C "$repo" gc --quiet 2>/dev/null
+    # lfs prune only drops local copies of objects the remote already has;
+    # unpushed objects are always retained.
+    [ "$have_lfs" -eq 1 ] && git -C "$repo" lfs prune >/dev/null 2>&1
+    a=$(du -sk "$gitdir" 2>/dev/null | awk '{print $1+0}'); a=${a:-0}
+    gc_n=$((gc_n+1)); gc_before=$((gc_before+b)); gc_after=$((gc_after+a))
+    [ $((b-a)) -gt 0 ] && \
+      printf "  -%-7s %s%s%s\n" "$(human $((b-a)))" "$GREY" "$repo" "$RESET"
+  done < <(repo_find)
+  saved=$((gc_before-gc_after)); [ "$saved" -lt 0 ] && saved=0
+  printf "  %sgc'd %d repo(s): .git %s -> %s (saved %s)%s\n" \
+    "$BOLD" "$gc_n" "$(human "$gc_before")" "$(human "$gc_after")" "$(human "$saved")" "$RESET"
 fi
 
 # ---- repos safe to delete ----
@@ -109,11 +179,7 @@ while IFS= read -r repo; do
   last=$(git -C "$repo" log -1 --format=%cs 2>/dev/null)
   url=$(git -C "$repo" remote get-url origin 2>/dev/null || echo '?')
   printf "%s\t%s\t%s\t%s\n" "${kb:-0}" "$last" "$repo" "$url" >> "$tmp"
-done < <(
-  find . -type d \( -name node_modules -o -name .venv -o -name venv -o -name .tox \
-                    -o -name .git -o -name vendor \) -prune -o \
-         -type d -exec test -e '{}/.git' ';' -print -prune | sort
-)
+done < <(repo_find)
 
 safe_n=$(wc -l < "$tmp" | tr -d ' ')
 safe_total=$(awk '{s+=$1} END{print s+0}' "$tmp")
