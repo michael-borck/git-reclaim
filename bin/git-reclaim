@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# git-sweep — reclaim disk space across a tree of git repos.
+# git-reclaim — reclaim disk space across a tree of git repos.
 #
 #   * Reports (and optionally purges) regenerable cache directories
 #     (node_modules, virtualenvs, build/test caches) — these are never
@@ -10,10 +10,10 @@
 #     remote, no unpushed commits on any local branch, no stashes — i.e. the
 #     remote already has everything, so you can re-clone what you remove.
 #
-# Installed on PATH as `git-sweep`, git runs it as `git sweep`.
+# Installed on PATH as `git-reclaim`, git runs it as `git reclaim`.
 #
 # Usage:
-#   git sweep [-p] [-g] [-r] [-d DIR]   (-h for full help)
+#   git reclaim [-p] [-g] [-r] [-d DIR]   (-h for full help)
 #
 #   (default)  dry run: report reclaimable cache space; deletes nothing
 #   -p         purge: delete the cache directories (skips any dir git tracks
@@ -31,7 +31,7 @@ SCAN_DIR="."
 
 usage() {
   cat <<'EOF'
-Usage: git sweep [-p] [-g] [-r] [-d DIR]
+Usage: git reclaim [-p] [-g] [-r] [-d DIR]
 
   (default)  dry run: report reclaimable cache space; deletes nothing
   -p         purge: delete the cache directories (any dir git tracks files

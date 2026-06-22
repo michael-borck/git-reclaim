@@ -7,7 +7,7 @@ setup() { common_setup; }
 @test "default dry run lists caches and deletes nothing" {
   mkrepo a
   mkdir -p a/node_modules && touch a/node_modules/f
-  run "$BIN/git-sweep"
+  run "$BIN/git-reclaim"
   [ "$status" -eq 0 ]
   [[ "$output" == *node_modules* ]]
   [[ "$output" == *"dry run"* ]]
@@ -18,7 +18,7 @@ setup() { common_setup; }
   mkrepo a
   mkdir -p a/node_modules && touch a/node_modules/f
   mkdir -p a/sub/target && touch a/sub/target/f
-  run "$BIN/git-sweep" -p
+  run "$BIN/git-reclaim" -p
   [ "$status" -eq 0 ]
   [ ! -d a/node_modules ]
   [ ! -d a/sub/target ]
@@ -30,7 +30,7 @@ setup() { common_setup; }
   git -C a branch target/v2
   git -C a branch venv/x
   mkdir -p a/node_modules && touch a/node_modules/f
-  run "$BIN/git-sweep" -p
+  run "$BIN/git-reclaim" -p
   git -C a rev-parse --verify -q refs/heads/target/v2
   git -C a rev-parse --verify -q refs/heads/venv/x
   [ ! -d a/node_modules ]
@@ -42,7 +42,7 @@ setup() { common_setup; }
   git -C a add target
   git -C a commit -qm "commit target dir"
   mkdir -p a/node_modules && touch a/node_modules/f
-  run "$BIN/git-sweep" -p
+  run "$BIN/git-reclaim" -p
   [ -d a/target ]
   [ -f a/target/tracked.txt ]
   [ ! -d a/node_modules ]
@@ -55,7 +55,7 @@ setup() { common_setup; }
   git clone -q origin pushed
   git clone -q origin messy
   touch messy/uncommitted.txt
-  run "$BIN/git-sweep" -r
+  run "$BIN/git-reclaim" -r
   [ "$status" -eq 0 ]
   [[ "$output" == *pushed* ]]
   [[ "$output" != *messy* ]]
@@ -67,7 +67,7 @@ setup() { common_setup; }
   mkrepo origin
   git clone -q origin clone
   git -C clone commit -q --allow-empty -m unpushed
-  run "$BIN/git-sweep" -r
+  run "$BIN/git-reclaim" -r
   [[ "$output" != *clone* ]]
   [[ "$output" == *"0 safe"* ]]
 }
@@ -77,13 +77,13 @@ setup() { common_setup; }
   seq 1 5000 > a/big.txt
   git -C a add big.txt
   git -C a commit -qm big
-  run "$BIN/git-sweep" -g
+  run "$BIN/git-reclaim" -g
   [ "$status" -eq 0 ]
   [[ "$output" == *"gc'd 1 repo(s)"* ]]
 }
 
 @test "-h prints usage and exits 0" {
-  run "$BIN/git-sweep" -h
+  run "$BIN/git-reclaim" -h
   [ "$status" -eq 0 ]
   [[ "$output" == *Usage:* ]]
 }
