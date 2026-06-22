@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # install.sh — symlink every git-* tool in ./bin into a directory on your PATH
-# so git picks them up as subcommands (e.g. bin/git-repos -> `git repos`).
+# so git picks them up as subcommands (e.g. bin/git-sweep -> `git sweep`).
 #
 # Usage:
 #   ./install.sh [TARGET_DIR]
@@ -25,7 +25,7 @@ done
 
 echo
 case ":$PATH:" in
-  *":$TARGET_DIR:"*) echo "$TARGET_DIR is on your PATH — try: git repos" ;;
+  *":$TARGET_DIR:"*) echo "$TARGET_DIR is on your PATH — try: git sweep" ;;
   *) echo "NOTE: $TARGET_DIR is not on your PATH. Add it, e.g.:"
      echo "  echo 'export PATH=\"$TARGET_DIR:\$PATH\"' >> ~/.zshrc" ;;
 esac
