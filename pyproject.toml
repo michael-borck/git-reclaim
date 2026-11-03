@@ -1,6 +1,6 @@
 [project]
 name = "git-reclaim"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reclaim disk space across a tree of git repositories"
 readme = "README.md"
 requires-python = ">=3.10"

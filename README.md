@@ -83,12 +83,26 @@ git reclaim -p           # actually purge the caches
 git reclaim -g           # repack every repo's .git (git gc)
 git reclaim -r           # caches report + list of repos safe to delete
 git reclaim -r -d ~/work # scan a different tree
+git reclaim --json       # machine-readable report
+git reclaim -r --min-size 100M  # only big clones
 ```
 
 > `git reclaim` only ever deletes **caches**, and only with `-p`; `-g` just
 > repacks history in place. It never deletes a repo. It just reports which are
 > safe, so you stay in control of removing whole clones. Pair it with the
 > re-clone URLs it prints.
+
+## JSON output
+
+`--json` prints one object with the cache report and any requested sections:
+
+```bash
+git reclaim --json
+git reclaim -p -g -r --json --min-size 10M
+```
+
+The object has `root`, `caches`, and optional `gc` and `safe_repos` sections.
+It is suitable for scripts, dashboards, and `jq`.
 
 ## Using it from `gita`
 

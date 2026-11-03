@@ -11,12 +11,15 @@ It has three independent jobs:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from git_reclaim import __version__
 
@@ -76,6 +79,17 @@ def human(kb: int) -> str:
     if kb >= 1024:
         return f"{kb // 1024}M"
     return f"{kb}K"
+
+
+def parse_size(text: str) -> int:
+    """Parse a human size such as 10M, 500K, or 1G into KiB."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*", text, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"invalid size: {text}")
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    factor = {"": 1, "K": 1, "M": 1024, "G": 1024**2, "T": 1024**3}[unit]
+    return int(value * factor)
 
 
 def du_kb(path: Path) -> int:
@@ -152,64 +166,102 @@ def git_tracks_files(path: Path) -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-def report_caches(root: Path, style: Style, purge: bool) -> None:
-    """Report caches and optionally delete them."""
+def collect_caches(root: Path, purge: bool, min_kb: int) -> dict[str, Any]:
+    """Collect cache data, and purge when requested."""
     caches = find_cache_dirs(root)
     sizes = sorted(((du_kb(path), path) for path in caches), reverse=True)
-
-    print(f"{style.bold}Regenerable caches under {root}{style.reset}")
-    if not sizes:
-        print(f"  {style.grey}none found{style.reset}")
-        return
-
-    for kb, path in sizes[:12]:
-        print(f"  {human(kb):<8} {style.grey}{path.relative_to(root)}{style.reset}")
-    if len(sizes) > 12:
-        print(f"  {style.grey}... and {len(sizes) - 12} more{style.reset}")
-
-    total = sum(kb for kb, _ in sizes)
-    print(
-        f"  {style.bold}{len(sizes)} cache dirs, {human(total)} reclaimable{style.reset}"
-    )
+    sizes = [(kb, path) for kb, path in sizes if kb >= min_kb]
+    entries: list[dict[str, Any]] = [
+        {
+            "path": str(path.relative_to(root)),
+            "size_kb": kb,
+            "purged": False,
+            "skipped": False,
+            "error": None,
+        }
+        for kb, path in sizes
+    ]
+    result: dict[str, Any] = {
+        "count": len(entries),
+        "total_kb": sum(kb for kb, _ in sizes),
+        "entries": entries,
+        "purged": 0,
+        "skipped": 0,
+        "failed": 0,
+        "freed_kb": 0,
+    }
 
     if not purge:
-        print(f"  {style.yellow}(dry run, pass -p to delete these){style.reset}")
-        return
+        return result
 
     before = shutil.disk_usage(root).free // 1024
-    purged = skipped = failed = 0
-    for _, path in sizes:
+    for entry, (_, path) in zip(entries, sizes, strict=True):
         if git_tracks_files(path):
-            print(
-                f"  {style.yellow}skipped {path.relative_to(root)} "
-                f"(git tracks files inside it){style.reset}"
-            )
-            skipped += 1
+            entry["skipped"] = True
+            result["skipped"] += 1
             continue
         try:
             shutil.rmtree(path)
-        except OSError:
-            failed += 1
+        except OSError as e:
+            entry["error"] = str(e)
+            result["failed"] += 1
         else:
-            purged += 1
+            entry["purged"] = True
+            result["purged"] += 1
 
     after = shutil.disk_usage(root).free // 1024
-    freed = max(0, after - before)
+    result["freed_kb"] = max(0, after - before)
+    return result
+
+
+def report_caches(root: Path, style: Style, data: dict[str, Any]) -> None:
+    """Print the cache report."""
+    print(f"{style.bold}Regenerable caches under {root}{style.reset}")
+    entries = data["entries"]
+    if not entries:
+        print(f"  {style.grey}none found{style.reset}")
+        return
+
+    for entry in entries[:12]:
+        print(
+            f"  {human(entry['size_kb']):<8} {style.grey}{entry['path']}{style.reset}"
+        )
+    if len(entries) > 12:
+        print(f"  {style.grey}... and {len(entries) - 12} more{style.reset}")
+
     print(
-        f"  {style.green}-> purged {purged} of {len(sizes)} dirs, "
-        f"freed {human(freed)} (free: {human(before)} -> {human(after)}){style.reset}"
+        f"  {style.bold}{data['count']} cache dirs, "
+        f"{human(data['total_kb'])} reclaimable{style.reset}"
     )
-    if failed:
-        print(f"  {style.red}-> {failed} dir(s) could not be removed{style.reset}")
+
+    if not data["purged"] and not data["skipped"] and not data["failed"]:
+        print(f"  {style.yellow}(dry run, pass -p to delete these){style.reset}")
+        return
+
+    for entry in entries:
+        if entry["skipped"]:
+            print(
+                f"  {style.yellow}skipped {entry['path']} "
+                f"(git tracks files inside it){style.reset}"
+            )
+        elif entry["error"]:
+            print(f"  {style.red}failed {entry['path']}: {entry['error']}{style.reset}")
+
+    print(
+        f"  {style.green}-> purged {data['purged']} of {data['count']} dirs, "
+        f"freed {human(data['freed_kb'])}{style.reset}"
+    )
+    if data["failed"]:
+        print(
+            f"  {style.red}-> {data['failed']} dir(s) could not be removed{style.reset}"
+        )
 
 
-def report_gc(root: Path, style: Style) -> None:
-    """Run git gc, and git lfs prune when available, in every repo."""
-    print()
-    print(f"{style.bold}Compacting repo history (git gc){style.reset}")
-
+def collect_gc(root: Path, min_kb: int) -> dict[str, Any]:
+    """Run git gc and collect the result."""
     have_lfs = shutil.which("git-lfs") is not None
-    count = before = after = 0
+    entries: list[dict[str, Any]] = []
+    before = after = 0
 
     for repo in find_repos(root):
         rev = git(repo, "rev-parse", "--absolute-git-dir")
@@ -217,36 +269,53 @@ def report_gc(root: Path, style: Style) -> None:
             continue
         gitdir = Path(rev.stdout.strip())
         size_before = du_kb(gitdir)
+        if size_before < min_kb:
+            continue
         git(repo, "gc", "--quiet", timeout=GC_TIMEOUT)
         if have_lfs:
             git(repo, "lfs", "prune", timeout=GC_TIMEOUT)
         size_after = du_kb(gitdir)
 
-        count += 1
         before += size_before
         after += size_after
-        if size_before > size_after:
-            print(
-                f"  -{human(size_before - size_after):<7} "
-                f"{style.grey}{repo.relative_to(root)}{style.reset}"
-            )
+        entries.append(
+            {
+                "repo": str(repo.relative_to(root)),
+                "before_kb": size_before,
+                "after_kb": size_after,
+                "saved_kb": max(0, size_before - size_after),
+            }
+        )
 
-    saved = max(0, before - after)
-    print(
-        f"  {style.bold}gc'd {count} repo(s): .git {human(before)} -> "
-        f"{human(after)} (saved {human(saved)}){style.reset}"
-    )
+    return {
+        "count": len(entries),
+        "before_kb": before,
+        "after_kb": after,
+        "saved_kb": max(0, before - after),
+        "entries": entries,
+    }
 
 
-def report_safe_repos(root: Path, style: Style) -> None:
-    """List clones where the remote already has everything."""
+def report_gc(root: Path, style: Style, data: dict[str, Any]) -> None:
+    """Print the git gc report."""
     print()
+    print(f"{style.bold}Compacting repo history (git gc){style.reset}")
+    for entry in data["entries"]:
+        if entry["saved_kb"] > 0:
+            print(
+                f"  -{human(entry['saved_kb']):<7} "
+                f"{style.grey}{entry['repo']}{style.reset}"
+            )
     print(
-        f"{style.bold}Repos safe to delete (remote has everything), "
-        f"biggest first{style.reset}"
+        f"  {style.bold}gc'd {data['count']} repo(s): .git "
+        f"{human(data['before_kb'])} -> {human(data['after_kb'])} "
+        f"(saved {human(data['saved_kb'])}){style.reset}"
     )
 
-    rows: list[tuple[int, str, Path, str]] = []
+
+def collect_safe_repos(root: Path, min_kb: int) -> dict[str, Any]:
+    """Collect clones where the remote already has everything."""
+    entries: list[dict[str, Any]] = []
     keep = 0
 
     for repo in find_repos(root):
@@ -263,21 +332,44 @@ def report_safe_repos(root: Path, style: Style) -> None:
             continue
 
         size = du_kb(repo)
+        if size < min_kb:
+            continue
         last = git(repo, "log", "-1", "--format=%cs").stdout.strip()
         url_result = git(repo, "remote", "get-url", "origin")
         url = url_result.stdout.strip() if url_result.returncode == 0 else "?"
-        rows.append((size, last, repo, url))
-
-    rows.sort(key=lambda row: row[0], reverse=True)
-    for size, last, repo, url in rows:
-        print(
-            f"  {human(size):<8} last:{last:<10} "
-            f"{str(repo.relative_to(root)):<44} {style.grey}{url}{style.reset}"
+        entries.append(
+            {
+                "repo": str(repo.relative_to(root)),
+                "size_kb": size,
+                "last_commit": last,
+                "url": url,
+            }
         )
 
-    total = sum(size for size, _, _, _ in rows)
+    entries.sort(key=lambda entry: entry["size_kb"], reverse=True)
+    return {
+        "safe": len(entries),
+        "keep": keep,
+        "safe_kb": sum(entry["size_kb"] for entry in entries),
+        "entries": entries,
+    }
+
+
+def report_safe_repos(root: Path, style: Style, data: dict[str, Any]) -> None:
+    """Print clones where the remote already has everything."""
+    print()
     print(
-        f"{style.bold}{len(rows)} safe ({human(total)}) / {keep} keep{style.reset}  "
+        f"{style.bold}Repos safe to delete (remote has everything), "
+        f"biggest first{style.reset}"
+    )
+    for entry in data["entries"]:
+        print(
+            f"  {human(entry['size_kb']):<8} last:{entry['last_commit']:<10} "
+            f"{entry['repo']:<44} {style.grey}{entry['url']}{style.reset}"
+        )
+    print(
+        f"{style.bold}{data['safe']} safe ({human(data['safe_kb'])}) / "
+        f"{data['keep']} keep{style.reset}  "
         f"{style.grey}(keep = dirty, unpushed, stashed, tagged, or no remote)"
         f"{style.reset}"
     )
@@ -293,7 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
             "-p         purge the cache directories (git-tracked dirs are skipped)\n"
             "-g         run git gc (and git lfs prune) in every repo\n"
             "-r         list repos that are safe to delete (size, last commit, URL)\n"
-            "-d DIR     directory to scan (default: current directory)"
+            "-d DIR     directory to scan (default: current directory)\n"
+            "--json     output a JSON report instead of text\n"
+            "--min-size SIZE  only include items at least this size (e.g. 10M)"
         ),
     )
     parser.add_argument(
@@ -322,6 +416,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory to scan (default: current directory)",
     )
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="output a JSON report instead of text",
+    )
+    parser.add_argument(
+        "--min-size",
+        default="0",
+        metavar="SIZE",
+        help="only include caches and repos at least this size (e.g. 10M)",
+    )
+    parser.add_argument(
         "-V",
         "--version",
         action="version",
@@ -338,14 +443,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot cd into {root}", file=sys.stderr)
         return 1
 
+    try:
+        min_kb = parse_size(args.min_size)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+
     root = root.resolve()
     style = Style.auto()
 
-    report_caches(root, style, args.purge)
+    caches = collect_caches(root, args.purge, min_kb)
+
+    if args.json:
+        payload: dict[str, Any] = {"root": str(root), "caches": caches}
+        if args.gc:
+            payload["gc"] = collect_gc(root, min_kb)
+        if args.repos:
+            payload["safe_repos"] = collect_safe_repos(root, min_kb)
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    report_caches(root, style, caches)
     if args.gc:
-        report_gc(root, style)
+        report_gc(root, style, collect_gc(root, min_kb))
     if args.repos:
-        report_safe_repos(root, style)
+        report_safe_repos(root, style, collect_safe_repos(root, min_kb))
     return 0
 
 

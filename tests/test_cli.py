@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from git_reclaim.cli import (
     find_cache_dirs,
     find_repos,
     main,
+    parse_size,
 )
 
 
@@ -222,3 +224,73 @@ def test_missing_dir_returns_error(
 
     assert main(["-d", str(missing)]) == 1
     assert "Cannot cd into" in capsys.readouterr().err
+
+
+def test_parse_size() -> None:
+    assert parse_size("10M") == 10240
+    assert parse_size("500K") == 500
+    assert parse_size("1G") == 1024 * 1024
+    assert parse_size("1.5M") == 1536
+    with pytest.raises(ValueError):
+        parse_size("nope")
+
+
+def test_json_dry_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = make_repo(tmp_path / "a")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "f").write_text("x")
+
+    assert main(["--json", "-d", str(tmp_path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["caches"]["count"] == 1
+    assert payload["caches"]["entries"][0]["path"] == "a/node_modules"
+    assert payload["caches"]["entries"][0]["purged"] is False
+
+
+def test_json_purge(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = make_repo(tmp_path / "a")
+    (repo / "node_modules").mkdir()
+
+    assert main(["--json", "-p", "-d", str(tmp_path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["caches"]["purged"] == 1
+    assert not (repo / "node_modules").exists()
+
+
+def test_min_size_filters(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = make_repo(tmp_path / "a")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "f").write_bytes(b"x" * (2 * 1024 * 1024))
+
+    assert main(["--json", "--min-size", "10M", "-d", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["caches"]["count"] == 0
+
+    assert main(["--json", "--min-size", "1K", "-d", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["caches"]["count"] == 1
+
+
+def test_json_safe_repos(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    origin = make_repo(tmp_path / "origin")
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(tmp_path / "pushed")], check=True
+    )
+
+    assert main(["--json", "-r", "-d", str(tmp_path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe_repos"]["safe"] == 1
+    assert payload["safe_repos"]["entries"][0]["repo"] == "pushed"
+
+
+def test_json_gc(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = make_repo(tmp_path / "a")
+    (repo / "big.txt").write_text("\n".join(str(i) for i in range(5000)))
+    run_git(repo, "add", "big.txt")
+    run_git(repo, "commit", "-q", "-m", "big")
+
+    assert main(["--json", "-g", "-d", str(tmp_path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["gc"]["count"] == 1
